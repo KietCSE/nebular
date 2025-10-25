@@ -14,7 +14,13 @@ class FedAvg(Aggregator):
 
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
-
+    """
+    models = {
+        "client1": [state_dict1, num_samples1],
+        "client2": [{layer_name1: torch.Tensor, layer_name2: torch.Tensor}, num_samples2],
+        ...
+    }
+    """
     def run_aggregation(self, models):
         super().run_aggregation(models)
 
