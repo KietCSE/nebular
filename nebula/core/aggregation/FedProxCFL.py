@@ -4,7 +4,7 @@ from nebula.core.aggregation.aggregator import Aggregator
 
 
 class FedProxCFL(Aggregator):
-    def __init__(self, config=None, mu=0.1, **kwargs):
+    def __init__(self, config=None, mu=0.01, **kwargs):
         super().__init__(config, **kwargs)
         self.mu = mu
 

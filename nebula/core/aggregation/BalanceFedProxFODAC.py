@@ -2,6 +2,7 @@ import gc
 import torch
 import math
 import logging
+import numpy as np
 
 from nebula.core.aggregation.aggregator import Aggregator
 
@@ -14,14 +15,36 @@ class BalanceFedProxFODAC(Aggregator):
         self.A = 0.7           # balance filtering constant
         self.K = 1.0           # decay factor
         self.a = 0.2           # weight between local and neighbors
-        self.mu = 0.1        # FedProx regularization strength
+        self.mu = 0.05         # FedProx regularization strength
 
-        # FODAC-related buffers
+        self.adj = kwargs.get("adjacency_matrix", None)
         self.prev_local_model = None
         self.prev_prox_center = None
-        self.W = kwargs.get("mixing_weights", None)  # {(i,j): w_ij}
+
+        self.W = self._build_W_from_topology(self.adj)
 
         logging.info(f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, mu={self.mu}")
+
+    def _sinkhorn_knopp(self, A, max_iter=1000, tol=1e-8):
+        A = np.array(A, dtype=float)
+        for _ in range(max_iter):
+            A /= A.sum(axis=1, keepdims=True)
+            A /= A.sum(axis=0, keepdims=True)
+            if np.allclose(A.sum(axis=1), 1, atol=tol) and np.allclose(A.sum(axis=0), 1, atol=tol):
+                break
+        return A
+
+    def _build_W_from_topology(self, adj):
+        if adj is None:
+            logging.warning(f"[{self.__class__.__name__}] No adjacency matrix provided. Using uniform weights.")
+            return None
+
+        A = np.maximum(adj, adj.T)
+        np.fill_diagonal(A, 1)
+        W = self._sinkhorn_knopp(A)
+        W_dict = {(i, j): float(W[i, j]) for i in range(W.shape[0]) for j in range(W.shape[1])}
+        logging.info(f"[{self.__class__.__name__}] Mixing matrix W built via Sinkhorn–Knopp normalization.")
+        return W_dict
 
     def get_local_model(self, models):
         if self._addr not in models:
@@ -29,14 +52,9 @@ class BalanceFedProxFODAC(Aggregator):
         return models[self._addr]
 
     def compute_prox_center(self, models):
-        """
-        FODAC dynamic update for prox_center:
-        r_i(t+1) = sum_j w_ij * r_j(t) + (w_i(t+1) - w_i(t))
-        """
         local_addr = self._addr
         local_model, _ = models[local_addr]
 
-        # Round 0: no previous prox_center -> use neighbor average as initialization
         if self.prev_prox_center is None or self.prev_local_model is None:
             logging.debug(f"[{self.__class__.__name__}] Initializing prox_center using neighbor average.")
             prox_center = self._compute_neighbor_average(models)
@@ -58,17 +76,23 @@ class BalanceFedProxFODAC(Aggregator):
                 # Consensus part: sum_j w_ij * r_j(t)
                 consensus_part = torch.zeros_like(local_model[layer])
                 for addr, r_j in neighbor_centers:
+                    try:
+                        node_i = int(local_addr)
+                        node_j = int(addr)
+                    except:
+                        node_i, node_j = local_addr, addr
+
                     if self.W:
-                        w_ij = self.W.get((local_addr, addr), 0.0)
+                        w_ij = self.W.get((node_i, node_j), 0.0)
                     else:
                         w_ij = 1.0 / len(neighbor_centers)
+
                     consensus_part += w_ij * r_j[layer]
 
                 # Dynamic part: (w_i^(t+1) - w_i^t)
                 delta = local_model[layer] - self.prev_local_model[layer]
                 r_i_new[layer] = consensus_part + delta
 
-        # Save for next round
         self.prev_local_model = {k: v.clone() for k, v in local_model.items()}
         self.prev_prox_center[local_addr] = {k: v.clone() for k, v in r_i_new.items()}
 
@@ -99,7 +123,6 @@ class BalanceFedProxFODAC(Aggregator):
             logging.error(f"[{self.__class__.__name__}] Failed to get round info: {e}")
             return models
 
-        # Compute ||r_i||
         prox_norm = math.sqrt(sum(torch.norm(param, p=2).item() ** 2 for param in prox_center.values()))
         threshold = self.A * math.exp(-self.K * current_round / total_rounds) * prox_norm
 
@@ -118,14 +141,7 @@ class BalanceFedProxFODAC(Aggregator):
 
         return filtered_models
 
-
     def run_aggregation(self, models):
-        """
-        FedProx-enhanced decentralized aggregation with FODAC prox center:
-        1. Compute prox center r_i(t+1)
-        2. Filter models based on distance to r_i
-        3. Aggregate with FedProx proximal correction
-        """
         super().run_aggregation(models)
 
         local_model, _ = self.get_local_model(models)
