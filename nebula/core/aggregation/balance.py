@@ -11,7 +11,7 @@ class Balance(Aggregator):
         # Constant for Balance algorithm
         self.A = 2
         self.K = 1
-        self.a = 0.5
+        self.a = 0.2
         logging.info(f"[{self.__class__.__name__}] Initializing BALANCE with A={self.A}, K={self.K}, a={self.a}")
 
 
@@ -90,11 +90,12 @@ class Balance(Aggregator):
         Args:
             models (dict): Dictionary of model updates, where keys are node addresses
                           and values are tuples of (model_parameters, weight).
-
         Returns:
             dict: Aggregated model parameters.
         """
         super().run_aggregation(models)
+
+        local_model, _ = self.get_local_model(models)
 
         filtered_models = self.remove_malicious_models(models)
         if not filtered_models:
@@ -103,7 +104,6 @@ class Balance(Aggregator):
 
         filtered_models = list(filtered_models.values())
 
-        local_model, _ = self.get_local_model(models)
 
         accum = {layer: torch.zeros_like(param, dtype=torch.float32) for layer, param in local_model.items()}
 

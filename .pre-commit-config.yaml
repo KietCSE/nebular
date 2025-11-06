@@ -6,8 +6,8 @@ repos:
       - id: check-merge-conflict
       - id: check-toml
       - id: check-yaml
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
+      # - id: end-of-file-fixer
+      # - id: trailing-whitespace
 
   # The checking system is disabled for now
   # - repo: https://github.com/astral-sh/ruff-pre-commit

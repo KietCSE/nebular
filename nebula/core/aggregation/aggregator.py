@@ -183,13 +183,20 @@ def create_aggregator(config, engine) -> Aggregator:
     from nebula.core.aggregation.balance import Balance
     from nebula.core.aggregation.fedawa import FedAWA
     from nebula.core.aggregation.fedawa2 import FedAWA2
-
+    from nebula.core.aggregation.fedawaCFL import FedAWACFL
+    from nebula.core.aggregation.fedawaDFL import FedAWADFL
+    from nebula.core.aggregation.fedadpCFL import FedAdp
+    from nebula.core.aggregation.fedadpDFL import FedAdpDFL
+    from nebula.core.aggregation.FedProxDFL import FedProxDFL
+    from nebula.core.aggregation.balanceAWA import HybridBalanceFedAWA
+    from nebula.core.aggregation.fedbalance import FedBalance
+    from nebula.core.aggregation.BalanceFedProxFODAC import BalanceFedProxFODAC
 
     ALGORITHM_MAP = {
         "FedAvg": FedAvg,
         "Krum": Krum,
         "Median": Median,
-        "TrimmedMean": FedAWA2,
+        "TrimmedMean": FedBalance,
     }
     algorithm = config.participant["aggregator_args"]["algorithm"]
     aggregator = ALGORITHM_MAP.get(algorithm)
