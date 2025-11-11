@@ -9,10 +9,10 @@ class BalanceFedProx(Aggregator):
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
         # Hyperparameters
-        self.A = 0.7           # balance filtering constant
+        self.A = 1.5           # balance filtering constant
         self.K = 1.0           # decay factor
-        self.a = 0.2           # weight between local and neighbors
-        self.mu = 0.05         # FedProx regularization strength
+        self.a = 0.4           # weight between local and neighbors
+        self.mu = 0.1         # FedProx regularization strength
         logging.info(f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, mu={self.mu}")
 
     def get_local_model(self, models):
