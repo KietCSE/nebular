@@ -3,174 +3,164 @@ import torch
 import math
 import logging
 import numpy as np
+from copy import deepcopy
 
 from nebula.core.aggregation.aggregator import Aggregator
 
 
 class BalanceFedProxFODAC(Aggregator):
+
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
 
         # Hyperparameters
-        self.A = 0.7           # balance filtering constant
-        self.K = 1.0           # decay factor
-        self.a = 0.2           # weight between local and neighbors
-        self.mu = 0.05         # FedProx regularization strength
+        self.A = float(kwargs.get("A", 0.7))       # balance filtering constant
+        self.K = float(kwargs.get("K", 1.0))       # decay factor
+        self.a = float(kwargs.get("a", 0.25))      # weight giữa local và neighbor
+        self.mu = float(kwargs.get("mu", 0.05))    # FedProx regularization
+        self.clip_norm = float(kwargs.get("clip_norm", 10.0))
 
+        # topology
         self.adj = kwargs.get("adjacency_matrix", None)
-        self.prev_local_model = None
-        self.prev_prox_center = None
+        self.W = self._build_W(self.adj)
 
-        self.W = self._build_W_from_topology(self.adj)
+        # FODAC states
+        self.x = None          # dynamic consensus state
+        self.r_prev = None     # previous reference (local model)
+        self.prev_local = None # previous local model
+        self.device = torch.device(kwargs.get("device", "cpu"))
 
-        logging.info(f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, mu={self.mu}")
+        logging.info(f"[{self.__class__.__name__}] Init A={self.A}, K={self.K}, a={self.a}, mu={self.mu}")
 
-    def _sinkhorn_knopp(self, A, max_iter=1000, tol=1e-8):
-        A = np.array(A, dtype=float)
-        for _ in range(max_iter):
-            A /= A.sum(axis=1, keepdims=True)
-            A /= A.sum(axis=0, keepdims=True)
-            if np.allclose(A.sum(axis=1), 1, atol=tol) and np.allclose(A.sum(axis=0), 1, atol=tol):
-                break
-        return A
-
-    def _build_W_from_topology(self, adj):
+    def _build_W(self, adj):
         if adj is None:
-            logging.warning(f"[{self.__class__.__name__}] No adjacency matrix provided. Using uniform weights.")
             return None
-
-        A = np.maximum(adj, adj.T)
+        A = np.array(adj, dtype=float)
+        A = np.maximum(A, A.T)
         np.fill_diagonal(A, 1)
-        W = self._sinkhorn_knopp(A)
-        W_dict = {(i, j): float(W[i, j]) for i in range(W.shape[0]) for j in range(W.shape[1])}
-        logging.info(f"[{self.__class__.__name__}] Mixing matrix W built via Sinkhorn–Knopp normalization.")
-        return W_dict
+        W = A / A.sum(axis=1, keepdims=True)
+        return W
 
-    def get_local_model(self, models):
-        if self._addr not in models:
-            raise ValueError(f"[{self.__class__.__name__}] Local model ({self._addr}) not found in models")
-        return models[self._addr]
+    def _clone_state(self, state):
+        return {k: v.detach().clone().to(self.device) for k, v in state.items()}
+
+    def _zeros_like_state(self, state):
+        return {k: torch.zeros_like(v) for k, v in state.items()}
+
+    def _l2_distance(self, s1, s2):
+        total = 0.0
+        for k in s1:
+            diff = s1[k].float() - s2[k].float()
+            total += float(torch.norm(diff, p=2).item() ** 2)
+        return math.sqrt(total)
 
     def compute_prox_center(self, models):
         local_addr = self._addr
-        local_model, _ = models[local_addr]
+        local_state, _ = models[local_addr]
+        local_state = self._clone_state(local_state)
 
-        if self.prev_prox_center is None or self.prev_local_model is None:
-            logging.debug(f"[{self.__class__.__name__}] Initializing prox_center using neighbor average.")
-            prox_center = self._compute_neighbor_average(models)
-            self.prev_prox_center = {addr: params for addr, (params, _) in models.items()}
-            self.prev_local_model = {k: v.clone() for k, v in local_model.items()}
-            return prox_center
+        # init lần đầu
+        if self.x is None or self.r_prev is None:
+            self.x = self._clone_state(local_state)
+            self.r_prev = self._clone_state(local_state)
+            self.prev_local = self._clone_state(local_state)
+            return deepcopy(self.x)
 
-        with torch.no_grad():
-            neighbor_centers = [
-                (addr, self.prev_prox_center[addr])
-                for addr in self.prev_prox_center if addr != local_addr
-            ]
+        # compute Δr_i(t)
+        delta_r = {k: (local_state[k] - self.r_prev[k]).detach().clone() for k in local_state}
 
-            if not neighbor_centers:
-                return self._compute_neighbor_average(models)
-
-            r_i_new = {}
-            for layer in local_model:
-                # Consensus part: sum_j w_ij * r_j(t)
-                consensus_part = torch.zeros_like(local_model[layer])
-                for addr, r_j in neighbor_centers:
-                    try:
-                        node_i = int(local_addr)
-                        node_j = int(addr)
-                    except:
-                        node_i, node_j = local_addr, addr
-
-                    if self.W:
-                        w_ij = self.W.get((node_i, node_j), 0.0)
-                    else:
-                        w_ij = 1.0 / len(neighbor_centers)
-
-                    consensus_part += w_ij * r_j[layer]
-
-                # Dynamic part: (w_i^(t+1) - w_i^t)
-                delta = local_model[layer] - self.prev_local_model[layer]
-                r_i_new[layer] = consensus_part + delta
-
-        self.prev_local_model = {k: v.clone() for k, v in local_model.items()}
-        self.prev_prox_center[local_addr] = {k: v.clone() for k, v in r_i_new.items()}
-
-        logging.debug(f"[{self.__class__.__name__}] Prox center updated via FODAC dynamic consensus.")
-        return r_i_new
-
-    def _compute_neighbor_average(self, models):
-        local_addr = self._addr
-        neighbor_models = [params for addr, (params, _) in models.items() if addr != local_addr]
-
-        if not neighbor_models:
-            return self.get_local_model(models)[0]
+        # neighbor consensus
+        addrs = list(models.keys())
+        neighbors = [addr for addr in addrs if addr != local_addr]
+        delta_consensus = self._zeros_like_state(self.x)
 
         with torch.no_grad():
-            r_i = {}
-            num_neighbors = len(neighbor_models)
-            for layer in neighbor_models[0]:
-                r_i[layer] = torch.zeros_like(neighbor_models[0][layer])
-                for model in neighbor_models:
-                    r_i[layer] += model[layer] / num_neighbors
-        return r_i
+            for nb in neighbors:
+                nb_state, _ = models[nb]
+                nb_state = {k: v.to(self.device) for k, v in nb_state.items()}
+                if self.W is not None:
+                    idx_i = addrs.index(local_addr)
+                    idx_j = addrs.index(nb)
+                    w_ij = float(self.W[idx_i, idx_j])
+                else:
+                    w_ij = 1.0 / len(neighbors)
+                for k in delta_consensus:
+                    delta_consensus[k] += w_ij * (nb_state[k] - self.x[k])
+
+            # update x
+            x_new = {}
+            for k in self.x:
+                x_new[k] = (self.x[k] + delta_consensus[k] + delta_r[k]).detach().clone()
+
+            self.x = deepcopy(x_new)
+            self.r_prev = deepcopy(local_state)
+            self.prev_local = deepcopy(local_state)
+
+        return deepcopy(self.x)
 
     def remove_malicious_models(self, models, prox_center):
         try:
-            current_round = self.engine.round + 1
-            total_rounds = self.engine.total_rounds
+            current_round = getattr(self.engine, "round", 0) + 1
+            total_rounds = max(1, getattr(self.engine, "total_rounds", 100))
         except AttributeError as e:
             logging.error(f"[{self.__class__.__name__}] Failed to get round info: {e}")
             return models
 
-        prox_norm = math.sqrt(sum(torch.norm(param, p=2).item() ** 2 for param in prox_center.values()))
+        prox_norm = math.sqrt(sum(torch.norm(p, p=2).item() ** 2 for p in prox_center.values()))
         threshold = self.A * math.exp(-self.K * current_round / total_rounds) * prox_norm
 
-        filtered_models = {}
-        for node_addr, (model_params, weight) in models.items():
-            if node_addr == self._addr:
+        local_addr = self._addr
+        filtered = {}
+
+        for addr, (params, w) in models.items():
+            if addr == local_addr:
                 continue
-
-            distance = math.sqrt(sum(torch.norm(prox_center[layer] - model_params[layer], p=2).item() ** 2
-                                     for layer in prox_center))
-            if distance <= threshold:
-                filtered_models[node_addr] = (model_params, weight)
-                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} accepted (dist={distance:.4f} ≤ thr={threshold:.4f})")
+            dist = self._l2_distance(params, prox_center)
+            if dist <= threshold:
+                filtered[addr] = (params, w)
+                logging.debug(f"[{self.__class__.__name__}] accept {addr} (dist={dist:.4f} ≤ thr={threshold:.4f})")
             else:
-                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} rejected (dist={distance:.4f} > thr={threshold:.4f})")
+                logging.debug(f"[{self.__class__.__name__}] reject {addr} (dist={dist:.4f} > thr={threshold:.4f})")
 
-        return filtered_models
+        return filtered
 
     def run_aggregation(self, models):
         super().run_aggregation(models)
 
-        local_model, _ = self.get_local_model(models)
+        local_model, _ = models[self._addr]
+        local_model = self._clone_state(local_model)
+
+        # 1. prox center qua FODAC
         prox_center = self.compute_prox_center(models)
-        filtered_models = self.remove_malicious_models(models, prox_center)
 
-        if not filtered_models:
-            logging.debug(f"[{self.__class__.__name__}] No models passed filtering; returning local model.")
-            return local_model
+        # 2. lọc theo balance gốc
+        filtered = self.remove_malicious_models(models, prox_center)
 
-        filtered_models = list(filtered_models.values())
-        S = len(filtered_models)
-        accum = {layer: torch.zeros_like(param) for layer, param in local_model.items()}
+        if not filtered:
+            logging.debug(f"[{self.__class__.__name__}] No valid neighbor; return local model.")
+            return deepcopy(local_model)
 
+        # 3. tính trung bình neighbor
+        S = len(filtered)
+        accum = self._zeros_like_state(local_model)
         with torch.no_grad():
-            for params, _ in filtered_models:
-                for layer in accum:
-                    accum[layer].add_(params[layer], alpha=1.0 / S)
+            for params, _ in filtered.values():
+                for k in accum:
+                    accum[k].add_(params[k], alpha=1.0 / S)
 
-            # result = a * wi + (1-a)*avg(wj) - mu*(wi - r_i)
-            for layer in accum:
-                prox_term = self.mu * (local_model[layer] - prox_center[layer])
-                accum[layer] = (
-                    self.a * local_model[layer]
-                    + (1 - self.a) * accum[layer]
-                    - prox_term
-                )
+            result = {}
+            for k in accum:
+                prox_term = self.mu * (local_model[k] - prox_center[k])
+                mixed = self.a * local_model[k] + (1 - self.a) * accum[k] - prox_term
 
-        del models, filtered_models
+                if self.clip_norm:
+                    norm = torch.norm(mixed).item()
+                    if norm > self.clip_norm:
+                        mixed = mixed * (self.clip_norm / norm)
+
+                result[k] = mixed.clone()
+
+        del models, filtered
         gc.collect()
-        logging.info(f"[{self.__class__.__name__}] BalanceFedProxFODAC aggregation completed.")
-        return accum
+        logging.info(f"[{self.__class__.__name__}] Aggregation done. Neighbors={S}")
+        return result
