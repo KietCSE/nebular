@@ -13,10 +13,10 @@ class BalanceFedProxFODAC(Aggregator):
         super().__init__(config, **kwargs)
 
         # Hyperparameters (có thể expose qua config)
-        self.A = float(kwargs.get("A", 0.7))        # filtering base
+        self.A = float(kwargs.get("A", 1.5))        # filtering base
         self.K = float(kwargs.get("K", 1.0))        # decay factor for threshold
-        self.alpha_mix = float(kwargs.get("a", 0.2))# weight between local and neighbors in final aggregation
-        self.mu = float(kwargs.get("mu", 0.05))     # FedProx strength (regularizer)
+        self.alpha_mix = float(kwargs.get("a", 0.4))# weight between local and neighbors in final aggregation
+        self.mu = float(kwargs.get("mu", 0.1))     # FedProx strength (regularizer)
         self.clip_norm = float(kwargs.get("clip_norm", 10.0))  # gradient/model clipping for stability
         self.device = torch.device(kwargs.get("device", "cpu"))
 
