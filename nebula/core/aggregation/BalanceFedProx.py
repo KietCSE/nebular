@@ -12,7 +12,7 @@ class BalanceFedProx(Aggregator):
         self.A = 1.5           # balance filtering constant
         self.K = 1.0           # decay factor
         self.a = 0.4           # weight between local and neighbors
-        self.mu = 0.1          # FedProx regularization strength
+        self.mu = 0.1         # FedProx regularization strength
         logging.info(f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, mu={self.mu}")
 
     def get_local_model(self, models):
@@ -51,11 +51,11 @@ class BalanceFedProx(Aggregator):
             logging.error(f"[{self.__class__.__name__}] Failed to get round info: {e}")
             return models
 
-        # Compute ||r_i|| as float
-        prox_norm_sq = 0.0
+        # Compute ||r_i||
+        prox_norm = 0.0
         for param in prox_center.values():
-            prox_norm_sq += (torch.norm(param, p=2).item()) ** 2
-        prox_norm = math.sqrt(prox_norm_sq)
+            prox_norm += torch.norm(param, p=2).item() ** 2
+        prox_norm = math.sqrt(prox_norm)
 
         threshold = self.A * math.exp(-self.K * current_round / total_rounds) * prox_norm
 
@@ -64,24 +64,18 @@ class BalanceFedProx(Aggregator):
             if node_addr == self._addr:
                 continue
 
-            # Compute ||wj - r_i|| as float
-            dist_sq = 0.0
+            # Compute ||wj - r_i||
+            distance = 0.0
             for layer in prox_center:
                 diff = prox_center[layer] - model_params[layer]
-                dist_sq += (torch.norm(diff, p=2).item()) ** 2
-            distance = math.sqrt(dist_sq)
+                distance += torch.norm(diff, p=2).item() ** 2
+            distance = math.sqrt(distance)
 
             if distance <= threshold:
                 filtered_models[node_addr] = (model_params, weight)
-                logging.debug(
-                    f"[{self.__class__.__name__}] Model {node_addr} accepted "
-                    f"(dist={distance:.4f} ≤ thr={threshold:.4f})"
-                )
+                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} accepted (dist={distance:.4f} ≤ thr={threshold:.4f})")
             else:
-                logging.debug(
-                    f"[{self.__class__.__name__}] Model {node_addr} rejected "
-                    f"(dist={distance:.4f} > thr={threshold:.4f})"
-                )
+                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} rejected (dist={distance:.4f} > thr={threshold:.4f})")
 
         return filtered_models
 
