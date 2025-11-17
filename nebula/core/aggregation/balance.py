@@ -1,9 +1,11 @@
 import gc
-import torch
-import math
 import logging
+import math
+
+import torch
 
 from nebula.core.aggregation.aggregator import Aggregator
+
 
 class Balance(Aggregator):
     def __init__(self, config=None, **kwargs):
@@ -11,15 +13,13 @@ class Balance(Aggregator):
         # Constant for Balance algorithm
         self.A = 2
         self.K = 1
-        self.a = 0.2
+        self.a = 0.4
         logging.info(f"[{self.__class__.__name__}] Initializing BALANCE with A={self.A}, K={self.K}, a={self.a}")
-
 
     def get_local_model(self, models):
         if self._addr not in models:
             raise ValueError(f"[{self.__class__.__name__}] Local model ({self._addr}) not found in models")
         return models[self._addr]
-
 
     def remove_malicious_models(self, models):
         """
@@ -50,7 +50,8 @@ class Balance(Aggregator):
         # Get norm of current local model ||wi||
         local_norm = 0.0
         for param in local_model.values():
-            local_norm += torch.norm(param, p=2).item() ** 2
+            tensor = param if param.is_floating_point() else param.float()
+            local_norm += torch.norm(tensor, p=2).item() ** 2
         local_norm = math.sqrt(local_norm)
         logging.debug(f"[{self.__class__.__name__}] Local model norm ||wi||: {local_norm:.4f}")
 
@@ -68,6 +69,9 @@ class Balance(Aggregator):
             distance = 0.0
             for layer in local_model:
                 diff = local_model[layer] - model_params[layer]
+                # Ensure diff is float
+                if not diff.is_floating_point():
+                    diff = diff.float()
                 distance += torch.norm(diff, p=2).item() ** 2
             distance = math.sqrt(distance)
 
@@ -103,8 +107,6 @@ class Balance(Aggregator):
             return local_model
 
         filtered_models = list(filtered_models.values())
-
-
         accum = {layer: torch.zeros_like(param, dtype=torch.float32) for layer, param in local_model.items()}
 
         S = len(filtered_models)
@@ -117,7 +119,7 @@ class Balance(Aggregator):
             else:
                 for params, _ in filtered_models:
                     for layer in accum:
-                        accum[layer].add_(params[layer], alpha=1.0 / S)
+                        accum[layer].add_(params[layer].to(accum[layer].dtype), alpha=1.0 / S)
 
                 # result = a * wi + (1-a) * (1/S) * sum(wj)
                 for layer in accum:
