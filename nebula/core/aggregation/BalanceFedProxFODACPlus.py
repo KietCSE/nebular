@@ -8,7 +8,7 @@ from copy import deepcopy
 from nebula.core.aggregation.aggregator import Aggregator
 
 
-class BalanceFedProxFODAC(Aggregator):
+class BalanceFedProxFODACPlus(Aggregator):
 
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
