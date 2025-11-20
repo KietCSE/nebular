@@ -17,7 +17,7 @@ class BalanceFedProxFODAC(Aggregator):
         self.A = float(kwargs.get("A", 1.5))       # balance filtering constant
         self.K = float(kwargs.get("K", 1.0))       # decay factor
         self.a = float(kwargs.get("a", 0.4))      # weight giữa local và neighbor
-        self.base_mu = float(kwargs.get("mu", 0.08))    # base FedProx regularization
+        self.mu = float(kwargs.get("mu", 0.1))    # FedProx regularization
         self.clip_norm = float(kwargs.get("clip_norm", 10.0))
 
         # topology
@@ -30,7 +30,7 @@ class BalanceFedProxFODAC(Aggregator):
         self.prev_local = None # previous local model
         self.device = torch.device(kwargs.get("device", "cpu"))
 
-        logging.info(f"[{self.__class__.__name__}] Init A={self.A}, K={self.K}, a={self.a}, base_mu={self.base_mu}, clip_norm={self.clip_norm}")
+        logging.info(f"[{self.__class__.__name__}] Init A={self.A}, K={self.K}, a={self.a}, mu={self.mu}")
 
     def _build_W(self, adj):
         if adj is None:
@@ -38,10 +38,7 @@ class BalanceFedProxFODAC(Aggregator):
         A = np.array(adj, dtype=float)
         A = np.maximum(A, A.T)
         np.fill_diagonal(A, 1)
-        # guard divide by zero
-        row_sums = A.sum(axis=1, keepdims=True)
-        row_sums[row_sums == 0] = 1.0
-        W = A / row_sums
+        W = A / A.sum(axis=1, keepdims=True)
         return W
 
     def _clone_state(self, state):
@@ -82,14 +79,11 @@ class BalanceFedProxFODAC(Aggregator):
                 nb_state, _ = models[nb]
                 nb_state = {k: v.to(self.device) for k, v in nb_state.items()}
                 if self.W is not None:
-                    try:
-                        idx_i = addrs.index(local_addr)
-                        idx_j = addrs.index(nb)
-                        w_ij = float(self.W[idx_i, idx_j])
-                    except ValueError:
-                        w_ij = 1.0 / max(1, len(neighbors))
+                    idx_i = addrs.index(local_addr)
+                    idx_j = addrs.index(nb)
+                    w_ij = float(self.W[idx_i, idx_j])
                 else:
-                    w_ij = 1.0 / max(1, len(neighbors))
+                    w_ij = 1.0 / len(neighbors)
                 for k in delta_consensus:
                     delta_consensus[k] += w_ij * (nb_state[k] - self.x[k])
 
@@ -130,104 +124,43 @@ class BalanceFedProxFODAC(Aggregator):
 
         return filtered
 
-    def _clip_tensor(self, t, max_norm):
-        if max_norm is None or max_norm <= 0:
-            return t
-        norm = torch.norm(t).item()
-        if norm > max_norm:
-            return t * (max_norm / (norm + 1e-12))
-        return t
-
     def run_aggregation(self, models):
         super().run_aggregation(models)
 
-        # local clone on device
         local_model, _ = models[self._addr]
         local_model = self._clone_state(local_model)
 
-        # 1. prox center via FODAC
+        # 1. prox center qua FODAC
         prox_center = self.compute_prox_center(models)
 
+        # 2. lọc theo balance gốc
         filtered = self.remove_malicious_models(models, prox_center)
 
         if not filtered:
             logging.debug(f"[{self.__class__.__name__}] No valid neighbor; return local model.")
             return deepcopy(local_model)
 
-        # 3. compute weighted average of neighbors (respect weight and topology W)
-        # Build list of neighbors' (state, weight)
-        addrs = list(models.keys())
+        # 3. tính trung bình neighbor
         S = len(filtered)
         accum = self._zeros_like_state(local_model)
-
-        # Prepare weights: consider both provided weight and topology W (if available)
-        raw_weights = []
-        states = []
-        for nb_addr, (nb_state, nb_w) in filtered.items():
-            # ensure tensor device
-            nb_state = {k: v.to(self.device) for k, v in nb_state.items()}
-            states.append(nb_state)
-            try:
-                w_val = float(nb_w)
-            except Exception:
-                w_val = 1.0
-            # combine with topology weight if W provided
-            if self.W is not None:
-                try:
-                    idx_i = addrs.index(self._addr)
-                    idx_j = addrs.index(nb_addr)
-                    topo_w = float(self.W[idx_i, idx_j])
-                except ValueError:
-                    topo_w = 1.0 / max(1, S)
-                combined = w_val * topo_w
-            else:
-                combined = w_val
-            raw_weights.append(max(0.0, combined))
-
-        total_w = sum(raw_weights)
-        if total_w <= 0:
-            # fallback equal weights
-            raw_weights = [1.0 for _ in raw_weights]
-            total_w = float(len(raw_weights))
-
-        # accumulate weighted average
         with torch.no_grad():
-            for s, w in zip(states, raw_weights):
+            for params, _ in filtered.values():
                 for k in accum:
-                    accum[k].add_(s[k], alpha=(w / total_w))
+                    accum[k].add_(params[k], alpha=1.0 / S)
 
-            # compute average distance to prox_center to adapt mu
-            avg_distance = 0.0
-            for s in states:
-                d_sq = 0.0
-                for k in prox_center:
-                    d_sq += float(torch.norm(prox_center[k] - s[k], p=2).item() ** 2)
-                avg_distance += math.sqrt(d_sq)
-            avg_distance = avg_distance / max(1, len(states))
-
-            # prox_norm for scaling
-            prox_norm = 0.0
-            for k in prox_center:
-                prox_norm += float(torch.norm(prox_center[k], p=2).item() ** 2)
-            prox_norm = math.sqrt(prox_norm) + 1e-12
-
-            # adaptive mu (between base_mu and 5*base_mu)
-            attack_factor = max(0.0, (avg_distance / prox_norm) - 0.1)
-            adaptive_mu = self.base_mu * (1.0 + min(4.0, attack_factor))
-            logging.debug(f"[{self.__class__.__name__}] avg_dist={avg_distance:.6f}, prox_norm={prox_norm:.6f}, adaptive_mu={adaptive_mu:.6f}")
-
-            # final combine per-layer with clipping
             result = {}
             for k in accum:
-                prox_term = adaptive_mu * (local_model[k] - prox_center[k])
-                prox_term = self._clip_tensor(prox_term, self.clip_norm)
+                prox_term = self.mu * (local_model[k] - prox_center[k])
+                mixed = self.a * local_model[k] + (1 - self.a) * accum[k] - prox_term
 
-                mixed = self.a * local_model[k] + (1.0 - self.a) * accum[k] - prox_term
-                mixed = self._clip_tensor(mixed, self.clip_norm)
+                if self.clip_norm:
+                    norm = torch.norm(mixed).item()
+                    if norm > self.clip_norm:
+                        mixed = mixed * (self.clip_norm / norm)
+
                 result[k] = mixed.clone()
 
-        # cleanup
         del models, filtered
         gc.collect()
-        logging.info(f"[{self.__class__.__name__}] Aggregation done. Neighbors={S}, adaptive_mu={adaptive_mu:.6f}")
+        logging.info(f"[{self.__class__.__name__}] Aggregation done. Neighbors={S}")
         return result
