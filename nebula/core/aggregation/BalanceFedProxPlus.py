@@ -2,87 +2,136 @@ import gc
 import torch
 import math
 import logging
-import numpy as np
-from copy import deepcopy
 
 from nebula.core.aggregation.aggregator import Aggregator
-
 
 class BalanceFedProxPlus(Aggregator):
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
-
-        self.A = float(kwargs.get("A", 1.5))       # base factor for filtering
-        self.K = float(kwargs.get("K", 1.0))       # decay factor for threshold
-        self.a = float(kwargs.get("a", 0.4))      # local weight in final mixing
-        self.mu = float(kwargs.get("mu", 0.1))    # FedProx regularization
-        self.clip_norm = float(kwargs.get("clip_norm", 10.0))  # clip to avoid instability
-
-        logging.info(f"[{self.__class__.__name__}] Init A={self.A}, K={self.K}, a={self.a}, mu={self.mu}")
+        # Hyperparameters (giữ nguyên mặc định ban đầu, có thể tune)
+        self.A = 1.5           # balance filtering constant
+        self.K = 1.0           # decay factor
+        self.a = 0.4           # weight between local and neighbors
+        self.base_mu = 0.1     # base FedProx regularization strength
+        # New params
+        self.trim_ratio = 0.2  # trimmed-mean ratio (0.0..0.5). Nếu nhỏ dataset, set 0
+        self.max_layer_norm = 10.0  # clip norm per-layer to reduce outliers
+        logging.info(f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, base_mu={self.base_mu}, trim_ratio={self.trim_ratio}")
 
     def get_local_model(self, models):
         if self._addr not in models:
-            raise ValueError(f"[{self.__class__.__name__}] Local model ({self._addr}) missing")
+            raise ValueError(f"[{self.__class__.__name__}] Local model ({self._addr}) not found in models")
         return models[self._addr]
 
     def compute_prox_center(self, models):
+        """
+        Compute r_i = average of all neighbor models (excluding self)
+        (unchanged)
+        """
         local_addr = self._addr
         neighbor_models = [params for addr, (params, _) in models.items() if addr != local_addr]
         if not neighbor_models:
-            return deepcopy(self.get_local_model(models)[0])
+            return self.get_local_model(models)[0]
 
         with torch.no_grad():
-            r_i = {k: torch.zeros_like(v) for k, v in neighbor_models[0].items()}
-            inv = 1.0 / len(neighbor_models)
-            for nb_model in neighbor_models:
-                for k in r_i:
-                    r_i[k].add_(nb_model[k], alpha=inv)
+            r_i = {}
+            num_neighbors = len(neighbor_models)
+            for layer in neighbor_models[0]:
+                r_i[layer] = torch.zeros_like(neighbor_models[0][layer])
+                for model in neighbor_models:
+                    r_i[layer] += model[layer] / num_neighbors
         return r_i
 
-    def _l2_distance(self, s1, s2):
-        total = 0.0
-        for k in s1:
-            diff = s1[k].float() - s2[k].float()
-            total += float(torch.norm(diff, p=2).item() ** 2)
-        return math.sqrt(total)
-
     def remove_malicious_models(self, models, prox_center):
-        local_addr = self._addr
-
-        distances = {}
-        for addr, (params, _) in models.items():
-            if addr == local_addr:
-                continue
-            distances[addr] = self._l2_distance(params, prox_center)
-
-        if not distances:
-            return {}
-
-        dists = np.array(list(distances.values()))
-        med = float(np.median(dists))
-        mad = float(np.median(np.abs(dists - med))) + 1e-8
-
+        """
+        Filter models based on prox-aware distance:
+        ||wj - r_i|| <= A * exp(-K * t / T) * ||r_i||
+        (UNCHANGED from your provided code)
+        """
         try:
-            current_round = getattr(self.engine, "round", 0) + 1
-            total_rounds = max(1, getattr(self.engine, "total_rounds", 100))
-        except Exception:
-            current_round = 1
-            total_rounds = 100
+            current_round = self.engine.round + 1
+            total_rounds = self.engine.total_rounds
+        except AttributeError as e:
+            logging.error(f"[{self.__class__.__name__}] Failed to get round info: {e}")
+            return models
 
-        decay = math.exp(-self.K * current_round / total_rounds)
-        beta = 2.5 * (1.0 - current_round / total_rounds) + 1.0  
-        threshold = (med + beta * mad) * (self.A * decay)
+        # Compute ||r_i||
+        prox_norm = 0.0
+        for param in prox_center.values():
+            prox_norm += torch.norm(param, p=2).item() ** 2
+        prox_norm = math.sqrt(prox_norm)
 
-        filtered = {
-            addr: (params, w)
-            for addr, (params, w) in models.items()
-            if addr != local_addr and distances[addr] <= threshold
-        }
+        threshold = self.A * math.exp(-self.K * current_round / total_rounds) * prox_norm
 
-        logging.debug(f"[{self.__class__.__name__}] Filter: kept {len(filtered)} / {len(distances)} models")
-        return filtered
+        filtered_models = {}
+        for node_addr, (model_params, weight) in models.items():
+            if node_addr == self._addr:
+                continue
+
+            # Compute ||wj - r_i||
+            distance = 0.0
+            for layer in prox_center:
+                diff = prox_center[layer] - model_params[layer]
+                distance += torch.norm(diff, p=2).item() ** 2
+            distance = math.sqrt(distance)
+
+            if distance <= threshold:
+                filtered_models[node_addr] = (model_params, weight)
+                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} accepted (dist={distance:.4f} ≤ thr={threshold:.4f})")
+            else:
+                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} rejected (dist={distance:.4f} > thr={threshold:.4f})")
+
+        return filtered_models
+
+    # ---------- helper: trimmed mean (element-wise) ----------
+    def _elementwise_trimmed_mean(self, tensor_list, trim_ratio):
+        """
+        tensor_list: list of tensors with same shape
+        trim_ratio: fraction to trim on each side (0..0.5). If 0 -> simple mean.
+        Returns tensor of same shape.
+        """
+        if not tensor_list:
+            raise ValueError("Empty tensor_list for trimmed mean")
+
+        if trim_ratio <= 0.0:
+            # weighted mean fallback handled elsewhere; here do simple mean
+            acc = torch.zeros_like(tensor_list[0])
+            for t in tensor_list:
+                acc.add_(t)
+            return acc / len(tensor_list)
+
+        # stack to shape (N, *shape)
+        stacked = torch.stack(tensor_list, dim=0)  # (N, ...)
+        N = stacked.shape[0]
+        k = int(math.floor(trim_ratio * N))
+        if 2 * k >= N:
+            # too aggressive trim -> just mean
+            return torch.mean(stacked, dim=0)
+
+        # compute element-wise sort across dim 0 by values
+        # To keep memory controlled we sort along dim 0 using torch.topk twice:
+        # But simpler: sort
+        sorted_vals, _ = torch.sort(stacked, dim=0)  # (N, ...)
+        trimmed = sorted_vals[k:N - k, ...]  # remove k smallest and k largest
+        return torch.mean(trimmed, dim=0)
+
+    def _clip_by_norm(self, tensor, max_norm):
+        norm = torch.norm(tensor, p=2)
+        if norm > max_norm:
+            return tensor * (max_norm / (norm + 1e-12))
+        return tensor
 
     def run_aggregation(self, models):
+        """
+        Improved FedProx-enhanced Balance aggregation:
+        - compute prox center (same)
+        - filter models using prox-aware condition (same)
+        - aggregate with:
+            * trimmed-mean (element-wise) when enough models
+            * weighted-average fallback
+            * per-layer clipping
+            * adaptive mu based on average distance to prox_center
+        """
         super().run_aggregation(models)
 
         local_model, _ = self.get_local_model(models)
@@ -90,31 +139,91 @@ class BalanceFedProxPlus(Aggregator):
         filtered_models = self.remove_malicious_models(models, prox_center)
 
         if not filtered_models:
-            logging.debug(f"[{self.__class__.__name__}] Không có neighbor hợp lệ, trả local model.")
-            return deepcopy(local_model)
+            logging.debug(f"[{self.__class__.__name__}] No models passed filtering; returning local model.")
+            return local_model
 
-        filtered_list = list(filtered_models.values())
-        S = len(filtered_list)
-        accum = {k: torch.zeros_like(v) for k, v in local_model.items()}
+        # Make list of (params, weight)
+        filtered_items = list(filtered_models.items())  # [(addr, (params, weight)), ...]
+        S = len(filtered_items)
+
+        # Estimate attack strength from average distance to prox_center (used to adapt mu)
+        avg_distance = 0.0
+        for _, (params, _) in filtered_items:
+            d = 0.0
+            for layer in prox_center:
+                d += torch.norm(prox_center[layer] - params[layer], p=2).item() ** 2
+            avg_distance += math.sqrt(d)
+        avg_distance /= S
+
+        # compute prox_norm for scaling
+        prox_norm = 0.0
+        for param in prox_center.values():
+            prox_norm += torch.norm(param, p=2).item() ** 2
+        prox_norm = math.sqrt(prox_norm) + 1e-12
+
+        # adaptive mu: if average distance relatively large, increase mu up to 5x
+        attack_factor = max(0.0, (avg_distance / prox_norm) - 0.1)  # little margin
+        adaptive_mu = self.base_mu * (1.0 + min(4.0, attack_factor))  # between base_mu and 5*base_mu
+        logging.debug(f"[{self.__class__.__name__}] avg_dist={avg_distance:.6f}, prox_norm={prox_norm:.6f}, adaptive_mu={adaptive_mu:.6f}")
+
+        # Prepare accum result per-layer
+        accum = {}
+        # For weighted average we sum weights
+        total_weight = 0.0
+        for _, (_, w) in filtered_items:
+            try:
+                total_weight += float(w)
+            except Exception:
+                total_weight += 1.0
+
+        # If no valid total_weight, fallback to equal weights
+        if total_weight <= 0:
+            total_weight = float(S)
 
         with torch.no_grad():
-            for params, _ in filtered_list:
-                for k in accum:
-                    accum[k].add_(params[k], alpha=1.0 / S)
+            for layer in local_model:
+                # collect tensors for this layer
+                tensors = []
+                weights = []
+                for _, (params, w) in filtered_items:
+                    tensors.append(params[layer])
+                    try:
+                        weights.append(float(w))
+                    except Exception:
+                        weights.append(1.0)
 
-            # FedProx term + mixing
-            result = {}
-            for k in accum:
-                prox_term = self.mu * (local_model[k] - prox_center[k])
-                mixed = self.a * local_model[k] + (1 - self.a) * accum[k] - prox_term
+                # If enough models and trim_ratio > 0 -> elementwise trimmed mean
+                if S >= 5 and self.trim_ratio > 0.0:
+                    # trimmed mean ignores weights (robust). If you prefer weighted trimmed, more complex.
+                    layer_avg = self._elementwise_trimmed_mean(tensors, self.trim_ratio)
+                else:
+                    # weighted mean
+                    layer_avg = torch.zeros_like(local_model[layer])
+                    for t, wt in zip(tensors, weights):
+                        layer_avg.add_(t, alpha=wt / total_weight)
 
-                if self.clip_norm:
-                    norm = torch.norm(mixed).item()
-                    if norm > self.clip_norm:
-                        mixed = mixed * (self.clip_norm / norm)
-                result[k] = mixed.clone()
+                # Clip the averaged layer to avoid single-layer huge values
+                layer_avg = self._clip_by_norm(layer_avg, self.max_layer_norm)
 
+                # FedProx proximal correction: prox_term = mu * (wi - r_i)
+                prox_term = adaptive_mu * (local_model[layer] - prox_center[layer])
+                # Clip prox_term as well
+                prox_term = self._clip_by_norm(prox_term, self.max_layer_norm)
+
+                # Final combination: a * wi + (1-a) * avg_wj - prox_term
+                result_layer = (
+                    self.a * local_model[layer] +
+                    (1.0 - self.a) * layer_avg -
+                    prox_term
+                )
+
+                # optional final clip
+                result_layer = self._clip_by_norm(result_layer, self.max_layer_norm)
+
+                accum[layer] = result_layer
+
+        # cleanup
         del models, filtered_models
         gc.collect()
-        logging.info(f"[{self.__class__.__name__}] BalanceFedProxPlus aggregation done. Neighbors={S}")
-        return result
+        logging.info(f"[{self.__class__.__name__}] BalanceFedProx aggregation completed (S={S}).")
+        return accum
