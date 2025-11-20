@@ -17,7 +17,7 @@ class BalanceFedProxFODAC(Aggregator):
         self.A = float(kwargs.get("A", 1.5))       # balance filtering constant
         self.K = float(kwargs.get("K", 1.0))       # decay factor
         self.a = float(kwargs.get("a", 0.4))      # weight giữa local và neighbor
-        self.base_mu = float(kwargs.get("mu", 0.1))    # base FedProx regularization
+        self.base_mu = float(kwargs.get("mu", 0.08))    # base FedProx regularization
         self.clip_norm = float(kwargs.get("clip_norm", 10.0))
 
         # topology
@@ -108,7 +108,6 @@ class BalanceFedProxFODAC(Aggregator):
         """
         Filter models based on prox-aware distance:
         ||wj - r_i|| <= A * exp(-K * t / T) * ||r_i||
-        (UNCHANGED)
         """
         try:
             current_round = self.engine.round + 1
@@ -160,10 +159,9 @@ class BalanceFedProxFODAC(Aggregator):
         local_model, _ = models[self._addr]
         local_model = self._clone_state(local_model)
 
-        # 1. prox center via FODAC (unchanged)
+        # 1. prox center via FODAC
         prox_center = self.compute_prox_center(models)
 
-        # 2. filter theo balance gốc (unchanged)
         filtered = self.remove_malicious_models(models, prox_center)
 
         if not filtered:
