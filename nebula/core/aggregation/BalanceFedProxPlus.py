@@ -8,7 +8,7 @@ from nebula.core.aggregation.aggregator import Aggregator
 class BalanceFedProxPlus(Aggregator):
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
-        # Hyperparameters (giữ nguyên mặc định ban đầu, có thể tune)
+        # Hyperparameters 
         self.A = 1.5           # balance filtering constant
         self.K = 1.0           # decay factor
         self.a = 0.4           # weight between local and neighbors
@@ -26,7 +26,6 @@ class BalanceFedProxPlus(Aggregator):
     def compute_prox_center(self, models):
         """
         Compute r_i = average of all neighbor models (excluding self)
-        (unchanged)
         """
         local_addr = self._addr
         neighbor_models = [params for addr, (params, _) in models.items() if addr != local_addr]
@@ -46,7 +45,6 @@ class BalanceFedProxPlus(Aggregator):
         """
         Filter models based on prox-aware distance:
         ||wj - r_i|| <= A * exp(-K * t / T) * ||r_i||
-        (UNCHANGED from your provided code)
         """
         try:
             current_round = self.engine.round + 1
@@ -83,7 +81,6 @@ class BalanceFedProxPlus(Aggregator):
 
         return filtered_models
 
-    # ---------- helper: trimmed mean (element-wise) ----------
     def _elementwise_trimmed_mean(self, tensor_list, trim_ratio):
         """
         tensor_list: list of tensors with same shape
