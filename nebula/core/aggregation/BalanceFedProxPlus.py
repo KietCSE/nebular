@@ -14,7 +14,7 @@ class BalanceFedProxPlus(Aggregator):
         self.a = 0.4           # weight between local and neighbors
         self.base_mu = 0.1     # base FedProx regularization strength
         # New params
-        self.trim_ratio = 0.2  # trimmed-mean ratio (0.0..0.5). Nếu nhỏ dataset, set 0
+        self.trim_ratio = 0.0  # trimmed-mean ratio (0.0..0.5). Nếu nhỏ dataset, set 0
         self.max_layer_norm = 10.0  # clip norm per-layer to reduce outliers
         logging.info(f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, base_mu={self.base_mu}, trim_ratio={self.trim_ratio}")
 
