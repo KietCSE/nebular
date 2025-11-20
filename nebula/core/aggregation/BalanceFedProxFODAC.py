@@ -99,30 +99,44 @@ class BalanceFedProxFODAC(Aggregator):
         return deepcopy(self.x)
 
     def remove_malicious_models(self, models, prox_center):
+        """
+        Filter models based on prox-aware distance:
+        ||wj - r_i|| <= A * exp(-K * t / T) * ||r_i||
+        """
         try:
-            current_round = getattr(self.engine, "round", 0) + 1
-            total_rounds = max(1, getattr(self.engine, "total_rounds", 100))
+            current_round = self.engine.round + 1
+            total_rounds = self.engine.total_rounds
         except AttributeError as e:
             logging.error(f"[{self.__class__.__name__}] Failed to get round info: {e}")
             return models
 
-        prox_norm = math.sqrt(sum(torch.norm(p, p=2).item() ** 2 for p in prox_center.values()))
+        # Compute ||r_i||
+        prox_norm = 0.0
+        for param in prox_center.values():
+            prox_norm += torch.norm(param, p=2).item() ** 2
+        prox_norm = math.sqrt(prox_norm)
+
         threshold = self.A * math.exp(-self.K * current_round / total_rounds) * prox_norm
 
-        local_addr = self._addr
-        filtered = {}
-
-        for addr, (params, w) in models.items():
-            if addr == local_addr:
+        filtered_models = {}
+        for node_addr, (model_params, weight) in models.items():
+            if node_addr == self._addr:
                 continue
-            dist = self._l2_distance(params, prox_center)
-            if dist <= threshold:
-                filtered[addr] = (params, w)
-                logging.debug(f"[{self.__class__.__name__}] accept {addr} (dist={dist:.4f} ≤ thr={threshold:.4f})")
-            else:
-                logging.debug(f"[{self.__class__.__name__}] reject {addr} (dist={dist:.4f} > thr={threshold:.4f})")
 
-        return filtered
+            # Compute ||wj - r_i||
+            distance = 0.0
+            for layer in prox_center:
+                diff = prox_center[layer] - model_params[layer]
+                distance += torch.norm(diff, p=2).item() ** 2
+            distance = math.sqrt(distance)
+
+            if distance <= threshold:
+                filtered_models[node_addr] = (model_params, weight)
+                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} accepted (dist={distance:.4f} ≤ thr={threshold:.4f})")
+            else:
+                logging.debug(f"[{self.__class__.__name__}] Model {node_addr} rejected (dist={distance:.4f} > thr={threshold:.4f})")
+
+        return filtered_models
 
     def run_aggregation(self, models):
         super().run_aggregation(models)
