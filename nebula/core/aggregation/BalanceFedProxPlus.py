@@ -127,7 +127,7 @@ class BalanceFedProxPlus(Aggregator):
 
         local_model, _ = self.get_local_model(models)
         filtered_models = self.remove_malicious_models(models)
-        prox_center = self.compute_prox_center(models)
+        prox_center = self.compute_prox_center(filtered_models)
 
         if not filtered_models:
             logging.debug(
