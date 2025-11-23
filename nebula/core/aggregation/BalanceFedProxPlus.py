@@ -70,7 +70,7 @@ class BalanceFedProxPlus(Aggregator):
 
             return self._ema_prox_center
 
-    def remove_malicious_models(self, models, prox_center):
+    def remove_malicious_models(self, models):
         try:
             current_round = self.engine.round + 1
             total_rounds = self.engine.total_rounds
@@ -126,8 +126,8 @@ class BalanceFedProxPlus(Aggregator):
         super().run_aggregation(models)
 
         local_model, _ = self.get_local_model(models)
+        filtered_models = self.remove_malicious_models(models)
         prox_center = self.compute_prox_center(models)
-        filtered_models = self.remove_malicious_models(models, prox_center)
 
         if not filtered_models:
             logging.debug(
