@@ -18,7 +18,7 @@ class BalanceFedProxPlus(Aggregator):
         self.mu = 0.1  # FedProx regularization
         self.ema_beta = 0.6  # EMA smoothing for prox_center
         self.norm_clip_ratio = 3.0  # reject if ||wj|| > ratio * ||r_i||
-        self.soft_k = 3.5  # softness factor for Gaussian decay
+        self.soft_k = 2.5  # softness factor for Gaussian decay
 
         # EMA buffer
         self._ema_prox_center = None
@@ -127,7 +127,7 @@ class BalanceFedProxPlus(Aggregator):
 
         local_model, _ = self.get_local_model(models)
         filtered_models = self.remove_malicious_models(models)
-        prox_center = self.compute_prox_center(filtered_models)
+        prox_center = self.compute_prox_center({**filtered_models, self._addr: (local_model, 0)})
 
         if not filtered_models:
             logging.debug(
