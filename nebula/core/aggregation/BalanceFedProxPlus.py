@@ -1,31 +1,37 @@
 import gc
-import torch
-import math
 import logging
+import math
+
+import torch
 
 from nebula.core.aggregation.aggregator import Aggregator
+
 
 class BalanceFedProxPlus(Aggregator):
     def __init__(self, config=None, **kwargs):
         super().__init__(config, **kwargs)
 
         # Hyperparameters
-        self.A = 1.5                     # filtering constant
-        self.K = 1.0                     # decay factor
-        self.a = 0.4                     # weight mix
-        self.mu = 0.1                    # FedProx regularization
-        self.ema_beta = 0.6              # EMA smoothing for prox_center
-        self.norm_clip_ratio = 3.0       # reject if ||wj|| > ratio * ||r_i||
-        self.soft_k = 2.5                # softness factor for Gaussian decay
+        self.A = 1.5  # filtering constant
+        self.K = 1.0  # decay factor
+        self.a = 0.5  # weight mix
+        self.mu = 0.1  # FedProx regularization
+        self.ema_beta = 0.6  # EMA smoothing for prox_center
+        self.norm_clip_ratio = 3.0  # reject if ||wj|| > ratio * ||r_i||
+        self.soft_k = 3.5  # softness factor for Gaussian decay
 
         # EMA buffer
         self._ema_prox_center = None
 
-        logging.info(f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, mu={self.mu}, EMA={self.ema_beta}")
+        logging.info(
+            f"[{self.__class__.__name__}] Initialized with A={self.A}, K={self.K}, a={self.a}, mu={self.mu}, EMA={self.ema_beta}"
+        )
 
     def get_local_model(self, models):
         if self._addr not in models:
-            raise ValueError(f"[{self.__class__.__name__}] Local model ({self._addr}) not found in models")
+            raise ValueError(
+                f"[{self.__class__.__name__}] Local model ({self._addr}) not found in models"
+            )
         return models[self._addr]
 
     # --------------------------------------------------------------
@@ -36,7 +42,9 @@ class BalanceFedProxPlus(Aggregator):
         r_i = average of neighbors, smoothed by EMA to reduce malicious spikes.
         """
         local_addr = self._addr
-        neighbor_models = [params for addr, (params, _) in models.items() if addr != local_addr]
+        neighbor_models = [
+            params for addr, (params, _) in models.items() if addr != local_addr
+        ]
 
         if not neighbor_models:
             return self.get_local_model(models)[0]
@@ -56,8 +64,8 @@ class BalanceFedProxPlus(Aggregator):
             else:
                 for layer in raw_center:
                     self._ema_prox_center[layer] = (
-                        self.ema_beta * self._ema_prox_center[layer] +
-                        (1 - self.ema_beta) * raw_center[layer]
+                        self.ema_beta * self._ema_prox_center[layer]
+                        + (1 - self.ema_beta) * raw_center[layer]
                     )
 
             return self._ema_prox_center
@@ -69,42 +77,47 @@ class BalanceFedProxPlus(Aggregator):
         except AttributeError:
             return models
 
-        # Compute ||r_i||
-        prox_norm = math.sqrt(sum(torch.norm(p).item() ** 2 for p in prox_center.values()))
+        local_model, _ = self.get_local_model(models)
 
-        # Base threshold
-        threshold = self.A * math.exp(-self.K * current_round / total_rounds) * prox_norm
+        wi_norm = math.sqrt(
+            sum(torch.norm(p).item() ** 2 for p in local_model.values())
+        )
+
+        threshold = self.A * math.exp(-self.K * current_round / total_rounds) * wi_norm
 
         filtered = {}
-        for node_addr, (model_params, weight) in models.items():
+
+        for node_addr, (model_params, _) in models.items():
             if node_addr == self._addr:
                 continue
 
-            # Compute distance ||wj - r_i||
-            distance = math.sqrt(sum(torch.norm(prox_center[layer] - model_params[layer]).item() ** 2
-                                     for layer in prox_center))
+            distance = math.sqrt(
+                sum(
+                    torch.norm(model_params[layer] - local_model[layer]).item() ** 2
+                    for layer in local_model
+                )
+            )
 
-            # Compute node ||wj||
-            wj_norm = math.sqrt(sum(torch.norm(v).item() ** 2 for v in model_params.values()))
-            norm_ratio = wj_norm / (prox_norm + 1e-9)
+            wj_norm = math.sqrt(
+                sum(torch.norm(v).item() ** 2 for v in model_params.values())
+            )
+            norm_ratio = wj_norm / (wi_norm + 1e-9)
 
-            # Reject if norm too large
             if norm_ratio > self.norm_clip_ratio:
                 logging.debug(
-                    f"[{self.__class__.__name__}] Model {node_addr} REJECTED (norm ratio {norm_ratio:.2f} > {self.norm_clip_ratio})"
+                    f"[{self.__class__.__name__}] Model {node_addr} REJECTED (norm ratio {norm_ratio:.2f})"
                 )
                 continue
 
-            # Soft weighting based on distance (Gaussian)
-            # w = exp(-(dist/thr)^2 * soft_k)
-            soft_weight = math.exp(- (distance / (threshold + 1e-9)) ** 2 * self.soft_k)
+            soft_weight = math.exp(
+                -((distance / (threshold + 1e-9)) ** 2) * self.soft_k
+            )
 
             logging.debug(
                 f"[{self.__class__.__name__}] Node={node_addr} dist={distance:.4f} thr={threshold:.4f} "
                 f"norm_ratio={norm_ratio:.2f} soft_w={soft_weight:.4f}"
             )
 
-            # Keep model with soft weight
             filtered[node_addr] = (model_params, soft_weight)
 
         return filtered
@@ -117,7 +130,9 @@ class BalanceFedProxPlus(Aggregator):
         filtered_models = self.remove_malicious_models(models, prox_center)
 
         if not filtered_models:
-            logging.debug(f"[{self.__class__.__name__}] No models passed filtering; returning local model.")
+            logging.debug(
+                f"[{self.__class__.__name__}] No models passed filtering; returning local model."
+            )
             return local_model
 
         # Soft-weights normalization
@@ -137,12 +152,14 @@ class BalanceFedProxPlus(Aggregator):
             for layer in accum:
                 prox_term = self.mu * (local_model[layer] - prox_center[layer])
                 accum[layer] = (
-                    self.a * local_model[layer] +
-                    (1 - self.a) * accum[layer] -
-                    prox_term
+                    self.a * local_model[layer]
+                    + (1 - self.a) * accum[layer]
+                    - prox_term
                 )
 
         del models, filtered_models
         gc.collect()
-        logging.info(f"[{self.__class__.__name__}] BalanceFedProx (EMA + Soft Filter) aggregation completed.")
+        logging.info(
+            f"[{self.__class__.__name__}] BalanceFedProx (EMA + Soft Filter) aggregation completed."
+        )
         return accum
